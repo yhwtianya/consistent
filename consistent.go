@@ -28,6 +28,7 @@ import (
 	"sync"
 )
 
+// 支持排序的uint32分片
 type uints []uint32
 
 // Len returns the length of the uints array.
@@ -44,12 +45,12 @@ var ErrEmptyCircle = errors.New("empty circle")
 
 // Consistent holds the information about the members of the consistent hash circle.
 type Consistent struct {
-	circle           map[uint32]string
-	members          map[string]bool
-	sortedHashes     uints
-	NumberOfReplicas int
-	count            int64
-	scratch          [64]byte
+	circle           map[uint32]string //记录虚拟节点hash和物理节点key的映射关系
+	members          map[string]bool   //记录添加到哈希环的物理节点key
+	sortedHashes     uints             //保存排序后的虚拟节点hash(uint32类型),方便进行二分查找
+	NumberOfReplicas int               //每个节点虚拟节点副本数量(包含物理节点)
+	count            int64             //物理节点数量
+	scratch          [64]byte          //此字段未使用
 	sync.RWMutex
 }
 
@@ -64,12 +65,14 @@ func New() *Consistent {
 	return c
 }
 
+// 根据key和NumberOfReplicas的索引生成虚拟节点key
 // eltKey generates a string key for an element with an index.
 func (c *Consistent) eltKey(elt string, idx int) string {
 	// return elt + "|" + strconv.Itoa(idx)
 	return strconv.Itoa(idx) + elt
 }
 
+// 添加节点到哈希环 加锁
 // Add inserts a string element in the consistent hash.
 func (c *Consistent) Add(elt string) {
 	c.Lock()
@@ -77,6 +80,7 @@ func (c *Consistent) Add(elt string) {
 	c.add(elt)
 }
 
+// 增加物理节点 无锁
 // need c.Lock() before calling
 func (c *Consistent) add(elt string) {
 	for i := 0; i < c.NumberOfReplicas; i++ {
@@ -87,6 +91,7 @@ func (c *Consistent) add(elt string) {
 	c.count++
 }
 
+// 删除物理节点 加锁
 // Remove removes an element from the hash.
 func (c *Consistent) Remove(elt string) {
 	c.Lock()
@@ -94,6 +99,7 @@ func (c *Consistent) Remove(elt string) {
 	c.remove(elt)
 }
 
+// 删除物理节点 无锁
 // need c.Lock() before calling
 func (c *Consistent) remove(elt string) {
 	for i := 0; i < c.NumberOfReplicas; i++ {
@@ -104,6 +110,7 @@ func (c *Consistent) remove(elt string) {
 	c.count--
 }
 
+// 对比member和elts,不存在在elts中的元素清除,elts多出的元素加入member
 // Set sets all the elements in the hash.  If there are existing elements not
 // present in elts, they will be removed.
 func (c *Consistent) Set(elts []string) {
@@ -130,6 +137,7 @@ func (c *Consistent) Set(elts []string) {
 	}
 }
 
+// 返回所有物理节点
 func (c *Consistent) Members() []string {
 	c.RLock()
 	defer c.RUnlock()
@@ -140,6 +148,7 @@ func (c *Consistent) Members() []string {
 	return m
 }
 
+// 获取元素(应该)所在的物理节点
 // Get returns an element close to where name hashes to in the circle.
 func (c *Consistent) Get(name string) (string, error) {
 	c.RLock()
@@ -147,15 +156,21 @@ func (c *Consistent) Get(name string) (string, error) {
 	if len(c.circle) == 0 {
 		return "", ErrEmptyCircle
 	}
+	// 求对象hash
 	key := c.hashKey(name)
+	// 查找hash对应虚拟节点位置
 	i := c.search(key)
+	// 查找虚拟节点对应的物理节点
 	return c.circle[c.sortedHashes[i]], nil
 }
 
+// 返回key所属虚拟节点hash
 func (c *Consistent) search(key uint32) (i int) {
+	// 闭包函数
 	f := func(x int) bool {
 		return c.sortedHashes[x] > key
 	}
+	// 二分查找,返回符合f的最小索引
 	i = sort.Search(len(c.sortedHashes), f)
 	if i >= len(c.sortedHashes) {
 		i = 0
@@ -163,6 +178,7 @@ func (c *Consistent) search(key uint32) (i int) {
 	return
 }
 
+// 获取最邻近的两个物理节点
 // GetTwo returns the two closest distinct elements to the name input in the circle.
 func (c *Consistent) GetTwo(name string) (string, string, error) {
 	c.RLock()
@@ -192,6 +208,7 @@ func (c *Consistent) GetTwo(name string) (string, string, error) {
 	return a, b, nil
 }
 
+// 获取最邻近的N个物理节点
 // GetN returns the N closest distinct elements to the name input in the circle.
 func (c *Consistent) GetN(name string, n int) ([]string, error) {
 	c.RLock()
@@ -235,6 +252,7 @@ func (c *Consistent) GetN(name string, n int) ([]string, error) {
 	return res, nil
 }
 
+// 返回hash值,类型为uint32
 func (c *Consistent) hashKey(key string) uint32 {
 	if len(key) < 64 {
 		var scratch [64]byte
@@ -244,12 +262,16 @@ func (c *Consistent) hashKey(key string) uint32 {
 	return crc32.ChecksumIEEE([]byte(key))
 }
 
+// 将虚拟节点hash,进行排序保存
 func (c *Consistent) updateSortedHashes() {
 	hashes := c.sortedHashes[:0]
+	// len(c.circle)总虚拟节点数
+	//
 	//reallocate if we're holding on to too much (1/4th)
 	if cap(c.sortedHashes)/(c.NumberOfReplicas*4) > len(c.circle) {
 		hashes = nil
 	}
+	// 遍历circle的key(虚拟节点hash值),放入排序分片,方便二分查找
 	for k := range c.circle {
 		hashes = append(hashes, k)
 	}
@@ -257,6 +279,7 @@ func (c *Consistent) updateSortedHashes() {
 	c.sortedHashes = hashes
 }
 
+// member是否在set中
 func sliceContainsMember(set []string, member string) bool {
 	for _, m := range set {
 		if m == member {
